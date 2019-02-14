@@ -17,13 +17,24 @@ opts = Trollop::options do
 end
 facts = {}
 
+def log(msg)
+  STDOUT.puts "%s: %s" % [Time.now, msg]
+end
+
 def collect_vcenter_facts(vim)
+  log("collect_vcenter_facts start")
   inventory = collect_inventory(vim.serviceContent.rootFolder)
+  log("DONE collect_inventory")
   name = vim.serviceContent.setting.setting.find{|x| x.key == 'VirtualCenter.InstanceName'}.value
+  log("DONE found name")
   customization_specs = vim.serviceContent.customizationSpecManager.info.collect{|spec| spec.name}
+  log("DONE found customization specs")
   storage_profiles = (exiting_profiles(vim).collect {|x| x.name} || [])
   version = vim.serviceContent.about.version
   build = vim.serviceContent.about.build
+
+  log("DONE collected storage profile")
+
   {
       :vcenter_name => name,
       :vcenter_version => version,
@@ -66,40 +77,61 @@ end
 
 def collect_inventory(obj, parent=nil)
   hash = collect_simple_inventory(obj, parent)
+  log("DONE collected simple inventory obj = #{obj} parent = #{parent}")
   case obj
     when RbVmomi::VIM::Folder
+      log("START collect_invenotry RbVmomi::VIM::Folder")
       obj.children.each { |resource| hash[:children] << collect_inventory(resource) }
+      log("END collect_invenotry RbVmomi::VIM::Folder")
     when RbVmomi::VIM::Datacenter
+      log("START RbVmomi::VIM::Datacenter")
       @datacenter_count += 1
       vds_children = obj.networkFolder.children.find_all{|x| x.is_a?(RbVmomi::VIM::VmwareDistributedVirtualSwitch)}
       (obj.hostFolder.children + vds_children).each { |resource| hash[:children] << collect_inventory(resource) }
+      log("END RbVmomi::VIM::Datacenter")
     when RbVmomi::VIM::ClusterComputeResource
+      log("START RbVmomi::VIM::ClusterComputeResource")
       @cluster_count += 1
       obj.host.each { |host| hash[:children] << collect_inventory(host) }
       hash[:attributes] = collect_cluster_attributes(obj)
+      log("END RbVmomi::VIM::ClusterComputeResource")
     when RbVmomi::VIM::ComputeResource
+      log("START RbVmomi::VIM::ComputeResource")
       #If ComputeResource but not ClusterComputeResource, it is a standalone host
       hash = collect_inventory(obj.host.first)
+      log("END RbVmomi::VIM::ComputeResource")
     when RbVmomi::VIM::HostSystem
+      log("START RbVmomi::VIM::HostSystem")
       # Will skip collecting the host configuration if "config" object is nil
       if obj.config
         @host_count += 1
         hash[:attributes] = collect_host_attributes(obj)
         (obj.vm + obj.datastore + obj.network).each{ |vm| hash[:children] << collect_inventory(vm, obj)}
       end
+      log("END RbVmomi::VIM::HostSystem")
     when RbVmomi::VIM::VirtualMachine
+      log("START RbVmomi::VIM::VirtualMachine")
       @vm_count += 1
       hash[:attributes] = collect_vm_attributes(obj)
+      log("END RbVmomi::VIM::VirtualMachine")
     when RbVmomi::VIM::Datastore
+      log("START RbVmomi::VIM::Datastore")
       hash[:attributes] = collect_datastore_attributes(obj, parent)
+      log("END RbVmomi::VIM::Datastore")
     when RbVmomi::VIM::VmwareDistributedVirtualSwitch
+       log("START RbVmomi::VIM::VmwareDistributedVirtualSwitch")
        hash[:attributes] = collect_distributed_switch_attributes(obj, parent)
        hash[:attributes]["hosts"] = obj.FetchDVPorts!.map {|d| d.proxyHost.name if d.proxyHost}.compact.uniq || []
        obj.portgroup.each {|portgroup| hash[:children] << collect_inventory(portgroup)}
+       log("START RbVmomi::VIM::VmwareDistributedVirtualSwitch")
     when RbVmomi::VIM::DistributedVirtualPortgroup
+      log("START RbVmomi::VIM::DistributedVirtualPortgroup")
       hash[:attributes] = collect_vds_portgroup_attributes(obj, parent)
+      log("END RbVmomi::VIM::DistributedVirtualPortgroup")
     when RbVmomi::VIM::Network
+      log("START RbVmomi::VIM::Network")
       hash[:attributes] = collect_portgroup_attributes(obj, parent)
+      log("END RbVmomi::VIM::Network")
     else
   end
   hash
@@ -160,7 +192,9 @@ def collect_host_attributes(host)
   attributes[:os_ip_address] = host.config.network.vnic[0].spec.ip.ipAddress
   attributes[:host_ip_addresses] = host.config.network.vnic.map { |vnic| vnic.spec.ip.ipAddress }
   attributes[:host_virtual_nics] = collect_host_vmk_ips(host)
+  log("About to collect host vib list for %s" % service_tag_array)
   attributes[:installed_software] = collect_host_vib_list(host) if host_connected?(host)
+  log("DONE About to collect host vib list for %s" % service_tag_array)
   attributes[:host_physical_nic] = collect_host_pnic_mac(host)
   attributes[:ntp_servers] = host.config.dateTimeInfo.ntpConfig.server
   host_config = get_host_config(host)
@@ -172,6 +206,8 @@ def collect_host_attributes(host)
     attributes[:maintenance_mode] = host.runtime.inMaintenanceMode
     attributes[:syslog] = host.configManager.advancedOption.setting.select { |x| x.key == "Syslog.global.logDir" }.first.value
   end
+
+  log("DONE collect_host_attributes")
   attributes
 end
 
@@ -274,6 +310,7 @@ def get_host_config(host)
 end
 
 def collect_vm_attributes(vm)
+  log("Collect_vm-attributes %s" % vm.summary.guest.hostName)
   nics = vm.guest.net
   unless nics.nil?
     ip_list = nics.map { |this_nic| this_nic.ipAddress[0] }
@@ -365,18 +402,17 @@ begin
     vim.close if vim # close open connection
   end
 rescue Timeout::Error
-  puts "Timed out trying to gather inventory"
+  log("Timed out trying to gather inventory")
   exit 1
 rescue Exception => e
-  puts "#{e}\n#{e.backtrace.join("\n")}"
+  log("#{e}\n#{e.backtrace.join("\n")}")
   exit 1
 else
   if facts.empty?
-    puts 'Could not get updated facts'
+    log('Could not get updated facts')
     exit 1
   else
-    puts 'Successfully gathered inventory.'
-    puts JSON.pretty_generate(JSON.parse(facts))
+    log('Successfully gathered inventory.')
     File.write(opts[:output], facts)
   end
 end
