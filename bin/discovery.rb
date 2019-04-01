@@ -18,6 +18,19 @@ end
 facts = {}
 @port_group_info = {}
 
+# MONKEY PATCH TO CACHE ALL host.config CALLS
+RbVmomi::VIM::HostSystem.class_eval do
+  alias :config_intercepted :config
+
+  HOST_CONFIG_CACHE = {}
+
+  def config
+    HOST_CONFIG_CACHE[self.name] ||= begin
+      config_intercepted
+    end
+  end
+end
+
 def collect_vcenter_facts(vim)
   create_port_group_metadata(vim.serviceContent.rootFolder)
   inventory = collect_inventory(vim.serviceContent.rootFolder)
