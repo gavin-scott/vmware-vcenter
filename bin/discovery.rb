@@ -99,7 +99,8 @@ def collect_inventory(obj, parent=nil)
        hash[:attributes]["hosts"] = obj.FetchDVPorts!.map {|d| d.proxyHost.name if d.proxyHost}.compact.uniq || []
        obj.portgroup.each {|portgroup| hash[:children] << collect_inventory(portgroup)}
     when RbVmomi::VIM::DistributedVirtualPortgroup
-      hash[:attributes] = collect_vds_portgroup_attributes(obj, parent)
+      pg_attrs = collect_vds_portgroup_attributes(obj, parent)
+      hash[:attributes] = pg_attrs if pg_attrs
     when RbVmomi::VIM::Network
       hash[:attributes] = collect_portgroup_attributes(obj, parent)
     else
@@ -352,6 +353,12 @@ end
 
 def collect_vds_portgroup_attributes(portgroup, parent = nil)
   portgroup_data = @port_group_info[portgroup.name]
+
+  unless portgroup_data
+    puts "WARNING: Could not collect VDS portgroup data for %s" % portgroup.name
+    return
+  end
+  
   if parent
     hostIps = []
     host = parent
