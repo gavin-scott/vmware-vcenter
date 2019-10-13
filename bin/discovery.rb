@@ -17,9 +17,11 @@ opts = Trollop::options do
 end
 facts = {}
 @port_group_info = {}
+@host_config = {}
 
 def collect_vcenter_facts(vim)
   create_port_group_metadata(vim.serviceContent.rootFolder)
+  create_datastore_metadata(vim.serviceContent.rootFolder)
   inventory = collect_inventory(vim.serviceContent.rootFolder)
   name = vim.serviceContent.setting.setting.find {|x| x.key == 'VirtualCenter.InstanceName'}.value
   customization_specs = vim.serviceContent.customizationSpecManager.info.collect {|spec| spec.name}
@@ -159,20 +161,24 @@ def collect_host_attributes(host)
     end
   end
   attributes[:service_tags] = service_tag_array
-  attributes[:os_ip_address] = host.config.network.vnic[0].spec.ip.ipAddress
-  attributes[:host_ip_addresses] = host.config.network.vnic.map { |vnic| vnic.spec.ip.ipAddress }
+  @host_config[host.name] ||= host.config
+  if @host_config[host.name].network.vnic
+    attributes[:os_ip_address] = @host_config[host.name].network.vnic[0].spec.ip.ipAddress if @host_config[host.name].network.vnic[0]
+    attributes[:host_ip_addresses] = @host_config[host.name].network.vnic.map { |vnic| vnic.spec.ip.ipAddress }
+  end
   attributes[:host_virtual_nics] = collect_host_vmk_ips(host)
   attributes[:host_physical_nic] = collect_host_pnic_mac(host)
-  attributes[:ntp_servers] = host.config.dateTimeInfo.ntpConfig.server
-  host_config = get_host_config(host)
-  if host_config
-    attributes[:hostname] = host_config.network.dnsConfig.hostName
-    attributes[:version] = host_config.product.version
-    attributes[:productName] = host_config.product.licenseProductName
-    attributes[:productVersion] = host_config.product.licenseProductVersion
+  attributes[:ntp_servers] = @host_config[host.name].dateTimeInfo.ntpConfig.server
+
+  if @host_config[host.name]
+    attributes[:hostname] = @host_config[host.name].network.dnsConfig.hostName if @host_config[host.name].network.dnsConfig
+    attributes[:version] = @host_config[host.name].product.version
+    attributes[:productName] = @host_config[host.name].product.licenseProductName
+    attributes[:productVersion] = @host_config[host.name].product.licenseProductVersion
     attributes[:maintenance_mode] = host.runtime.inMaintenanceMode
     attributes[:syslog] = host.configManager.advancedOption.setting.select { |x| x.key == "Syslog.global.logDir" }.first.value
   end
+
   attributes
 end
 
@@ -196,82 +202,32 @@ rescue
 end
 
 def collect_host_vmk_ips(host)
-  host_virtual_nic_array = host.config.network.vnic
-  virtual_nic_ip_array = host_virtual_nic_array.map { |hv_nic| hv_nic[:spec][:ip][:ipAddress] }
+  host_virtual_nic_array = @host_config[host.name].network.vnic
+  host_virtual_nic_array.map { |hv_nic| hv_nic[:spec][:ip][:ipAddress] }
 end
 
 def collect_host_pnic_mac(host)
-  host.config.network.pnic.map { |pnic| {:device => pnic[:device], :mac => pnic[:mac] } }
+  @host_config[host.name].network.pnic.map { |pnic| {:device => pnic[:device], :mac => pnic[:mac] } }
 end
 
 def collect_datastore_attributes(ds, parent=nil)
+  ds_info = @datastore_info
   attributes = {}
-  #There seems to be some cases where a datastore has no hosts.  Seems like a case of bad data, but we don't want to break on this either way
-  unless ds.host.empty?
-    #Have to go through many steps in order to get the iscsi name and the iscsi group IP.  All the data doesn't seem to be in one place
-    # so we have to get a piece of data from one place, and match it up to a different place to get all the data we want.
-    if parent
-      host = ds.host.find{|host| host.key.name == parent.name}.key
-    else
-      host = ds.host.first.key
-    end
-    host_config = get_host_config(host)
-    return attributes if host_config.nil?
-    mount_info = host_config.fileSystemVolume.mountInfo.find{|x| x.volume.name == ds.name}
-    attributes[:volume_name] = mount_info.volume.name
-    # Capacity will be returned back in gigabytes
-    attributes[:capacity] = mount_info.volume.capacity / 1024.0 / 1024.0 / 1024.0
-    if mount_info.volume.is_a?(RbVmomi::VIM::HostNasVolume)
-      attributes[:nfs_host] = mount_info.volume.remoteHost
-      attributes[:nfs_path] = mount_info.volume.remotePath
-    elsif mount_info.volume.is_a?(RbVmomi::VIM::HostVmfsVolume)
-      scsi_lun_disk_name = mount_info.volume.extent.first.diskName
-      attributes[:scsi_device_id] = scsi_lun_disk_name
-      host_storage_device = host_config.storageDevice
-      host_scsi_disk = host_storage_device.scsiLun.find{|lun| lun.canonicalName == scsi_lun_disk_name}
-      unless host_scsi_disk.nil?
-        attributes[:vendor] = (host_scsi_disk.vendor || '').strip
-        scsi_lun_uuid = host_scsi_disk.uuid
-        topology_targets = host_config.storageDevice.scsiTopology.adapter.collect do |adapter|
-          adapter.target.find_all do |target|
-            (target.transport.is_a?(RbVmomi::VIM::HostInternetScsiTargetTransport) ||
-                target.transport.is_a?(RbVmomi::VIM::HostFibreChannelOverEthernetTargetTransport)) &&
-                target.lun.find{|lun| lun.key.include?(scsi_lun_uuid)}
-          end
-        end.flatten
-        unless topology_targets.empty?
-          #List of topology targets will have largely the same information that's necessary, so we'll just check the first one
-          transport = topology_targets.first.transport
-          if transport.is_a?(RbVmomi::VIM::HostInternetScsiTargetTransport)
-            iscsi_name = transport.iScsiName
-            attributes[:iscsi_iqn] = iscsi_name
-            address = ''
-            host_storage_device.hostBusAdapter.each do |hba|
-              if hba.respond_to?('configuredStaticTarget')
-                target = hba.configuredStaticTarget.find{|target| target.iScsiName == iscsi_name}
-                unless target.nil?
-                  address = target.address
-                  break
-                end
-              end
-            end
-            attributes[:iscsi_group_ip] = address
-          elsif transport.is_a?(RbVmomi::VIM::HostFibreChannelOverEthernetTargetTransport)
-            wwpn = transport.portWorldWideName.to_s(16)
-            attributes[:fcoe_wwpn] = wwpn
-          end
-        end
-      end
-    end
+
+  if ds_info[ds.name] &&
+    ds_info[ds.name]["hosts"] &&
+    ds_info[ds.name]["hosts"].include?(parent.name)
+    attributes = ds_info[ds.name]["attributes"]
   end
+
   attributes
 end
 
 # Getting the host configuration manager can take 1-2 seconds.  Each datastore querying it can add a large amount of time to the inventory.
 # This method helps by giving a cached version of the configuration manager to save a lot of the query time for the same host
 def get_host_config(host)
-  @host_configs ||= {}
-  @host_configs[host.name] ||= host.config
+  @host_config ||= {}
+  @host_config[host.name] ||= host.config
 end
 
 # MONKEY PATCH TO CACHE ALL host.config CALLS
@@ -292,29 +248,113 @@ def collect_vm_attributes(vm)
   unless nics.nil?
     ip_list = nics.map { |this_nic| this_nic.ipAddress[0] }
   end
-  unless vm.summary.storage.nil?
-    disk_size_gb = (vm.summary.storage.committed + vm.summary.storage.uncommitted) / (1024 * 1024 * 1024)
+
+  vm_summary = vm.summary
+  vm_summary_config = vm_summary.config
+  vm_summary_storage = vm_summary.storage
+  unless vm_summary_storage.nil?
+    disk_size_gb = (vm_summary_storage.committed + vm_summary_storage.uncommitted) / (1024 * 1024 * 1024)
   end
-  {:template => vm.summary.config.template,
-  :hostname => vm.summary.guest.hostName,
+
+  {:template => vm_summary_config.template,
+  :hostname => vm_summary.guest.hostName,
   :vm_ips => ip_list,
   :datastore => vm.datastore&.first&.name || "",
-  :num_cpu => vm.summary.config.numCpu,
+  :num_cpu => vm_summary_config.numCpu,
   :disk_size_gb => disk_size_gb,
-  :memory_size_mb => vm.summary.config.memorySizeMB}
+  :memory_size_mb => vm_summary_config.memorySizeMB}
 end
 
 def collect_distributed_switch_attributes(obj, parent)
-  active_uplinks = obj.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder.activeUplinkPort || []
-  standby_uplinks = obj.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder.standbyUplinkPort || []
+  port_order = obj.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder
+  active_uplinks = port_order.activeUplinkPort || []
+  standby_uplinks = port_order.standbyUplinkPort || []
   uplinks = active_uplinks + standby_uplinks
   host_pnic_devices = obj.config.host.map do |host|
-    { :host_id => host.config.host._ref, :devices => host.config.backing.pnicSpec.map { |pnic_spec| pnic_spec[:pnicDevice] }}
+    host_config = host.config
+    { :host_id => host_config.host._ref, :devices => host_config.backing.pnicSpec.map { |pnic_spec| pnic_spec[:pnicDevice] }}
   end
 
   {:active_uplinks => active_uplinks, :standby_uplinks => standby_uplinks, :uplink_names => uplinks, :host_pnic_devices => host_pnic_devices}
-
 end
+
+def create_datastore_metadata(obj)
+  datastore_info = {}
+  obj.children.each do |dc|
+    next unless dc.respond_to?(:datastore)
+
+    dss = dc.datastore
+    dss.each do |ds|
+      attributes = {}
+      datastore_name = ds.name
+      datastore_info[datastore_name] ||= {}
+      datastore_info[datastore_name]["hosts"] ||= []
+      datastore_info[datastore_name]["hosts"].push(*ds.host.map {|k| k.key.name})
+      next unless ds.host.first
+      
+      host = ds.host.first.key
+      host_config = @host_config[host.name]
+      next unless host_config
+
+      next unless host_config.fileSystemVolume
+
+      next unless host_config.fileSystemVolume.mountInfo
+
+      mount_info = host_config.fileSystemVolume.mountInfo.find{|x| x.volume.name == ds.name}
+      next unless mount_info
+
+      attributes[:volume_name] = mount_info.volume.name
+      # Capacity will be returned back in gigabytes
+      attributes[:capacity] = mount_info.volume.capacity / 1024.0 / 1024.0 / 1024.0
+      if mount_info.volume.is_a?(RbVmomi::VIM::HostNasVolume)
+        attributes[:nfs_host] = mount_info.volume.remoteHost
+        attributes[:nfs_path] = mount_info.volume.remotePath
+      elsif mount_info.volume.is_a?(RbVmomi::VIM::HostVmfsVolume)
+        scsi_lun_disk_name = mount_info.volume.extent.first.diskName
+        attributes[:scsi_device_id] = scsi_lun_disk_name
+        host_storage_device = host_config.storageDevice
+        host_scsi_disk = host_storage_device.scsiLun.find{|lun| lun.canonicalName == scsi_lun_disk_name}
+        unless host_scsi_disk.nil?
+          attributes[:vendor] = (host_scsi_disk.vendor || '').strip
+          scsi_lun_uuid = host_scsi_disk.uuid
+          topology_targets = host_config.storageDevice.scsiTopology.adapter.collect do |adapter|
+            adapter.target.find_all do |target|
+              (target.transport.is_a?(RbVmomi::VIM::HostInternetScsiTargetTransport) ||
+                target.transport.is_a?(RbVmomi::VIM::HostFibreChannelOverEthernetTargetTransport)) &&
+                target.lun.find{|lun| lun.key.include?(scsi_lun_uuid)}
+            end
+          end.flatten
+          unless topology_targets.empty?
+            #List of topology targets will have largely the same information that's necessary, so we'll just check the first one
+            transport = topology_targets.first.transport
+            if transport.is_a?(RbVmomi::VIM::HostInternetScsiTargetTransport)
+              iscsi_name = transport.iScsiName
+              attributes[:iscsi_iqn] = iscsi_name
+              address = ''
+              host_storage_device.hostBusAdapter.each do |hba|
+                if hba.respond_to?('configuredStaticTarget')
+                  target = hba.configuredStaticTarget.find{|target| target.iScsiName == iscsi_name}
+                  unless target.nil?
+                    address = target.address
+                    break
+                  end
+                end
+              end
+              attributes[:iscsi_group_ip] = address
+            elsif transport.is_a?(RbVmomi::VIM::HostFibreChannelOverEthernetTargetTransport)
+              wwpn = transport.portWorldWideName.to_s(16)
+              attributes[:fcoe_wwpn] = wwpn
+            end
+          end
+        end
+      end
+      datastore_info[ds.name]["attributes"] = attributes
+    end
+  end
+
+  @datastore_info = datastore_info
+end
+
 
 def create_port_group_metadata(obj)
   obj.children.each do |dc|
@@ -322,17 +362,22 @@ def create_port_group_metadata(obj)
 
     dc.networkFolder.children.each do |network_obj|
       if network_obj.class == RbVmomi::VIM::DistributedVirtualPortgroup && RbVmomi::VIM::Network
-        active_uplinks = network_obj.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder.activeUplinkPort
-        standby_uplinks = network_obj.config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder.standbyUplinkPort
+        network_obj_config = network_obj.config
+        uplink_port_order = network_obj_config.defaultPortConfig.uplinkTeamingPolicy.uplinkPortOrder
+        active_uplinks = uplink_port_order.activeUplinkPort
+        standby_uplinks = uplink_port_order.standbyUplinkPort
         portgroup_hosts_info = {network_obj.name => {"hosts_info" => {}, "uplinks" => {:active_uplinks => active_uplinks,
                                                                                        :standby_uplinks => standby_uplinks}}}
-        if network_obj.config.defaultPortConfig.vlan.respond_to?(:vlanId)
-          portgroup_hosts_info[network_obj.name]["vlan_id"] = network_obj.config.defaultPortConfig.vlan.vlanId
+        default_port_config_vlan = network_obj_config.defaultPortConfig.vlan
+        if default_port_config_vlan.respond_to?(:vlanId)
+          portgroup_hosts_info[network_obj.name]["vlan_id"] = default_port_config_vlan.vlanId
         end
 
         network_obj.host.map do |host|
-          next unless host.config
-          vnic = host.config.network.vnic.select {|vnic| vnic.spec.distributedVirtualPort.portgroupKey == network_obj._ref unless vnic.spec.distributedVirtualPort.nil?}
+          @host_config[host.name] ||= host.config
+          next unless @host_config[host.name]
+
+          vnic = @host_config[host.name].network.vnic.select {|vnic| vnic.spec.distributedVirtualPort.portgroupKey == network_obj._ref unless vnic.spec.distributedVirtualPort.nil?}
           v = (vnic || []).first
           detail = v.spec.ip.ipAddress if v && v.spec && v.spec.ip && v.spec.ip.ipAddress
 
@@ -341,6 +386,23 @@ def create_port_group_metadata(obj)
         end
         teaming_policy = network_obj.config.defaultPortConfig.uplinkTeamingPolicy.policy.value
         portgroup_hosts_info[network_obj.name]["teaming_policy"] = teaming_policy
+        portgroup_hosts_info[network_obj.name]["uplink"] = !!network_obj&.config&.uplink
+
+        @port_group_info.merge!(portgroup_hosts_info)
+      elsif network_obj.class == RbVmomi::VIM::Network
+        portgroup_hosts_info = {network_obj.name => {"hosts_info" => {}}}
+        detail = []
+        network_obj.host.map do |host|
+          @host_config[host.name] ||= host.config
+          next unless @host_config[host.name]
+
+          port_groups = host.configManager.networkSystem.networkInfo.portgroup
+          port_groups.each do |pg|
+            detail.push(:name => pg.spec.name, :vlan_id => pg.spec.vlanId, :vswitch => pg.spec.vswitchName)
+          end
+          portgroup_hosts_info[network_obj.name]["hosts_info"].merge!({host.name => detail})
+          detail
+        end
         @port_group_info.merge!(portgroup_hosts_info)
       end
     end
@@ -348,17 +410,25 @@ def create_port_group_metadata(obj)
 end
 
 def collect_vds_portgroup_attributes(portgroup, parent = nil)
-  portgroup_data = @port_group_info[portgroup.name]
+  port_group_name = portgroup.name
+  portgroup_data = @port_group_info[port_group_name] || {"uplinks" => {}, "uplink" => false}
+
+  default_response = portgroup_data["uplinks"].merge(:host_ip_addresses => [])
+                       .merge("teaming_policy" => portgroup_data["teaming_policy"])
+                       .merge("uplink" => portgroup_data["uplink"])
+  return default_response unless portgroup_data["hosts_info"]
+
+  host_ips = []
   if parent
-    hostIps = []
     host = parent
-    host_ip_info = portgroup_data["hosts_info"].select {|h, _| h == host.name}
-    hostIps << host_ip_info[host.name] if host_ip_info && host_ip_info[host.name]
+    host_name = host.name
+    host_ip_info = portgroup_data["hosts_info"].select {|h, _| h == host_name}
+    host_ips << host_ip_info[host_name] if host_ip_info && host_ip_info[host_name]
   else
-    hostIps = portgroup_data["hosts_info"].values if @port_group_info[portgroup.name]
+    host_ips = portgroup_data["hosts_info"].values if @port_group_info[port_group_name]
   end
-  default_response = portgroup_data["uplinks"].merge(:host_ip_addresses => (hostIps || []).compact)
-                                              .merge("teaming_policy" => portgroup_data["teaming_policy"])
+
+  default_response[:host_ip_addresses] = host_ips || []
   return default_response unless portgroup_data["vlan_id"]
 
   return default_response unless portgroup_data["vlan_id"].is_a?(Integer)
@@ -368,21 +438,20 @@ def collect_vds_portgroup_attributes(portgroup, parent = nil)
 end
 
 def collect_portgroup_attributes(network_obj, parent)
-  # In case ESXi server is in non-responding state then need to skip port-group information
-  network_host = network_obj.host.select {|h| h.name == parent.name}.first
-  return {} if network_host.summary.runtime.connectionState == "disconnected"
+  pg_name = network_obj.name
+  parent_name = parent.name
+  if @port_group_info[pg_name] && @port_group_info[pg_name]["hosts_info"] &&
+    @port_group_info[pg_name]["hosts_info"][parent_name]
+    info = (@port_group_info[pg_name]["hosts_info"][parent_name] || []).find {|n| n[:name] == pg_name}
+    return {} unless info
+    vlan_id = info[:vlan_id]
+    vswitch_name = info[:vswitch]
+    return {} unless vlan_id.is_a?(Integer)
 
-  return {} unless network_host.configManager
-  return {} unless network_host.configManager.networkSystem.networkInfo
-
-  network = network_host.configManager.networkSystem.networkInfo.portgroup.select { |x| x.spec.name == network_obj.name }
-
-  vlan_id = network.first.spec.vlanId
-  vswitch_name = network.first.spec.vswitchName
-
-  return {} unless vlan_id.is_a?(Integer)
-
-  {:vlan_id => vlan_id, :vswitch_name => vswitch_name}
+    {:vlan_id => vlan_id, :vswitch_name => vswitch_name}
+  else
+    return {}
+  end
 end
 
 begin
