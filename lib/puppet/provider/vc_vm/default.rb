@@ -282,6 +282,9 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
       # We can do first, because there should only be one PMEM datastore on host
       # See vmware doc: https://docs.vmware.com/en/VMware-vSphere/6.7/com.vmware.vsphere.storage.doc/GUID-93E5390A-8FCF-4CE1-8927-9FC36E889D00.html
       capacity = find_vm_host.summary.quickStats.availablePMemCapacity
+      raise("Could not determine any capacity for NVDIMM") unless capacity
+
+      capacity = capacity - (capacity % 4)
 
       Puppet.debug("The specified NVDIMM capacity was %s" % capacity.to_s)
       raise("The capacity %s is too small to attach NVDIMM." % capacity.to_s) if capacity < 4
