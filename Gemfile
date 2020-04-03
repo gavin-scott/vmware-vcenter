@@ -3,7 +3,7 @@ source 'https://rubygems.org'
 gem 'hashdiff'
 gem 'rbvmomi', '2.0.1'
 gem 'net-ssh'
-gem 'dell-asm-util', :git => 'https://github.com/dell-asm/dell-asm-util.git', :branch => 'master'
+gem 'dell-asm-util', :git => 'git@eos2git.cec.lab.emc.com:vxfm/dell-asm-util.git', :branch => 'master'
 
 group :development, :test do
   gem 'rake'
