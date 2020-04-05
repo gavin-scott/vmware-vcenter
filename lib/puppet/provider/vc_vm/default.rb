@@ -19,6 +19,11 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     return !!vm if resource[:ensure] == :absent
 
     vm && cdrom_iso == resource[:iso_file]
+    vm && compute_resources_configured?
+  end
+
+  def compute_resources_configured?
+    vm.config.hardware.numCPU == resource[:num_cpus] && vm.config.hardware.memoryMB == resource[:memory_mb]
   end
 
    # return the mounted iso file name
@@ -227,6 +232,10 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     # PCI passthrough can be enabled after VM is created because vm_host is required for this process
     configure_pci_passthru
 
+    # CPU and Memory resources can be configured after deployment (usually during FlexOS GW upgrade)
+    # If you call this, make sure the vm is shutdown
+    configure_compute_resources
+
     if resource[:enable_nvdimm]
       configure_nvdimm
     end
@@ -247,6 +256,10 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     else
       Puppet.debug("Skipping PCI pass through configuration for vm: as no devices available." % resource[:name])
     end
+  end
+
+  def configure_compute_resources
+    vm_memory_cpu_scsi_for_svm(vm, resource[:memory_mb], resource[:num_cpus]) unless compute_resources_configured?
   end
 
   def host_nvdimm_datastores
