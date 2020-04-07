@@ -18,8 +18,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
 
     return !!vm if resource[:ensure] == :absent
 
-    vm && cdrom_iso == resource[:iso_file]
-    vm && compute_resources_configured?
+    vm && cdrom_iso == resource[:iso_file] && compute_resources_configured?
   end
 
   def compute_resources_configured?
