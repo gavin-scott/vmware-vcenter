@@ -285,7 +285,7 @@ describe "vm create and clone behavior testing" do
       net2.stubs(:name).returns("FlexData1")
       provider.resource[:network_interfaces] = [{"portgroup" => {:pg_name => "FlexMgmt", :vds_name => "VDS1"}}, {"portgroup" => {:pg_name => "FlexData1", :vds_name => "VDS2"}}]
       computeResource.stubs(:network).returns([net1, net2])
-      expect(provider.network_mappings(ovf_url,computeResource)).to eq({"VM Network" => net2, "VM Network 1" => net2, "VM Network 2" => net1})
+      expect(provider.network_mappings(ovf_url,computeResource)).to eq({"VM Network" => net2, "VM Network 1" => nil, "VM Network 2" => net1})
     end  
   end
 
