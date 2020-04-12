@@ -1218,7 +1218,8 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     raise("Unable to obtain ovf from: %s" % ovf_url) unless ovf
 
     ovf.remove_namespaces!
-    networks = ovf.xpath('//NetworkSection/Network').map{|x| x['name']}
+    network_objs = ovf.xpath('//NetworkSection/Network')
+    networks = network_objs.map{|x| x['name']}
     return network_mappings unless networks
 
     # If list of networks were passed as input then map them to the VM Networks in the
@@ -1233,12 +1234,12 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
         Puppet.debug("Mapping network %s to %s" % [networks[index], this_net.name])
         network_mappings[networks[index]] = this_net
       end
+
       # If input network list was smaller than number of VM Networks in the OVF
       # Fill in remaining OVF networks with last available input network
       if resource[:network_interfaces].size < networks.size
         networks[resource[:network_interfaces].size..-1].each do |net|
-          network_mappings[net] = this_net
-          Puppet.debug("Mapping network %s to %s" % [net, this_net.name])
+          network_objs.map {|x| x.remove if x.attr("name") == net }
         end
       end
     else
@@ -1247,8 +1248,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     end
     
     network_mappings = adjust_networks_flex_svm(network_mappings, networks) if resource[:network_interfaces]
-    
-    network_mappings     
+    network_mappings
   end
 
   # Fixes issue with VMware Network mapping not being applied in logical order
