@@ -1238,8 +1238,11 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
       # If input network list was smaller than number of VM Networks in the OVF
       # Fill in remaining OVF networks with last available input network
       if resource[:network_interfaces].size < networks.size
+        vm_net = cluster.network.find{|x| x.name == "VM Network"}
+        spare_network = vm_net.nil? ? this_net : vm_net
         networks[resource[:network_interfaces].size..-1].each do |net|
-          network_objs.map {|x| x.remove if x.attr("name") == net }
+          Puppet.debug("Mapping network %s to %s" % [net, spare_network.name])
+          network_mappings[net] = spare_network
         end
       end
     else
