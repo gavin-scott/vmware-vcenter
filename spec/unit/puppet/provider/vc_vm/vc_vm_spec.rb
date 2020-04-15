@@ -197,7 +197,6 @@ describe "vm create and clone behavior testing" do
       provider.expects(:vm).at_least_once.returns(nil).returns(vm)
       provider.expects(:cdrom_iso).returns(mock("cdrom_object"))
       provider.expects(:iso_file).returns(mock("cdrom_object"))
-      provider.expects(:compute_resources_configured?).returns(true)
       provider.expects(:configure_pci_passthru)
       provider.initialize_property_flush
     end
