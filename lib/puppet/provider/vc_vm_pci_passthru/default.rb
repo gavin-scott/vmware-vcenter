@@ -104,11 +104,23 @@ Puppet::Type.type(:vc_vm_pci_passthru).provide(:vc_vm_pci_passthru, :parent => P
     @__vm ||= findvm_by_name(datacenter.vmFolder, resource[:name])
   end
 
+  def host_folders(base_object, host_folder=[])
+    if child_objects = base_object.children
+      child_objects.map {|c| host_folders(c, host_folder) if c.is_a?(RbVmomi::VIM::Folder)}
+      child_objects.each do |c|
+        host_folders(c, host_folder) if c.is_a?(RbVmomi::VIM::Folder)
+        host_folder.push(c.host) if c.respond_to?(:host)
+      end
+    end
+
+    host_folder.flatten.uniq
+  end
+
   # finds host to add nfs_datastore and returns the host object
   def find_vm_host
     # datacenter.hostFolder.children is a tree with clusters having hosts in it.
     # needs to flatten nested array
-    hosts = datacenter.hostFolder.children.map { |child| child.host }.flatten
+    hosts = host_folders(datacenter.hostFolder)
     host = hosts.select { |host|
       host.vm.find { |hvm|
         hvm == vm
