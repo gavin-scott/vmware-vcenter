@@ -238,12 +238,12 @@ describe "vm create and clone behavior testing" do
       hardware.expects(:device).returns([])
       config.expects(:hardware).returns(hardware)
       vm.expects(:config).returns(config)
+      provider.expects(:assign_networks)
       ovfManager.expects(:deployOVF).returns(vm)
       computeResource.expects(:resourcePool).returns("rp")
       computeResource.expects(:name).returns("FlexCluster")
       host.expects(:name).returns("FlexHost")
       provider.expects(:host_from_datastore).returns(host)
-      provider.expects(:network_mappings).returns({})
       provider.expects(:vim).twice.returns(vim)
       provider.create      
     end
@@ -266,47 +266,102 @@ describe "vm create and clone behavior testing" do
       hardware.expects(:device).returns([])
       config.expects(:hardware).returns(hardware)
       vm.expects(:config).returns(config)
+      provider.expects(:assign_networks)
       ovfManager.expects(:deployOVF).returns(vm)
       computeResource.expects(:resourcePool).returns("rp")
       computeResource.expects(:name).returns("FlexCluster")
       host.expects(:name).returns("FlexHost")
       provider.expects(:host_from_datastore).returns(host)
-      provider.expects(:network_mappings).returns({})
       provider.expects(:vim).twice.returns(vim)
       expect { provider.create }.to raise_error(RuntimeError)
     end
   end
 
-  context "#network mappings" do
-    it "should provide network mappings when ovf has networks" do
-      ovf_url = File.join(provider_path, '/spec/fixtures/unit/puppet/provider/vc_vm/ovf.xml')
-      net1.stubs(:name).returns("FlexMgmt")
-      net2.stubs(:name).returns("FlexData1")
-      provider.resource[:network_interfaces] = [{"portgroup" => {:pg_name => "FlexMgmt", :vds_name => "VDS1"}}, {"portgroup" => {:pg_name => "FlexData1", :vds_name => "VDS2"}}]
-      computeResource.stubs(:network).returns([net1, net2])
-      expect(provider.network_mappings(ovf_url,computeResource)).to eq({"VM Network" => net2, "VM Network 1" => net2, "VM Network 2" => net1})
-    end  
-  end
+  context "assign_networks" do
+    it "should raise an error if no VM returned" do
+      provider.expects(:vm).returns(nil)
+      expect { provider.assign_networks }.to raise_error("Virtual machine required to assign networks")
+    end
 
-  context "#adjust_networks_flex_svm" do
-    it "should reorder networks" do
-      ovf_url = File.join(provider_path, '/spec/fixtures/unit/puppet/provider/vc_vm/ovf.xml')
-      network_mappings = {}
-      # Query OVF to find any networks which need to be mapped
-      begin
-        ovf = open(ovf_url, 'r'){|io| Nokogiri::XML(io.read)}
-      rescue
-        Puppet.debug("Failed to open ovf: %s for reason: %s" % [ovf_url.to_s, $!.to_s])
-        raise
-      end
-      net1.stubs(:name).returns("FlexMgmt")
-      net2.stubs(:name).returns("FlexData1")
-      net3.stubs(:name).returns("FlexData2")
-      ovf.remove_namespaces!
-      networks = ovf.xpath('//NetworkSection/Network').map{|x| x['name']}
-      net_maps = {"VM Network" => net1, "VM Network 1" => net2, "VM Network 2" => net3}
-      new_map = provider.adjust_networks_flex_svm(net_maps, networks)
-      expect(new_map).to eq({"VM Network" => net2, "VM Network 1" => net3, "VM Network 2" => net1})
+    it "should create a nic assignment for each network if nic is not present" do
+      vm = mock("vm")
+      hardware = mock("hardware")
+      config = mock("config")
+      net_config = mock("net_config")
+      cluster = mock("cluster")
+      portgroup = mock("portgroup")
+      portgroup.stubs(:name).returns("mgmt")
+      net_config.expects(:key).returns(456)
+      vds = mock("vds")
+      vds.expects(:uuid).at_least_once.returns("50 36 1b 02 5b 5b 0a 01-ee cc 98 61 79 58 8f 63")
+      net_config.expects(:distributedVirtualSwitch).at_least_once.returns(vds)
+      portgroup.stubs(:config).returns(net_config)
+      cluster.expects(:network).returns([portgroup])
+      vm.stubs(:config).returns(config)
+      config.stubs(:hardware).returns(hardware)
+      hardware.stubs(:device).returns([])
+      provider.stubs(:resource).returns(:network_interfaces => ["network"])
+      provider.expects(:network_names).returns("pg_name" => "mgmt")
+      provider.expects(:power_state).at_least_once.returns("PoweredOff")
+      provider.stubs(:cluster).returns(cluster)
+      task = mock("task")
+      info = mock("info")
+      info.expects(:state).returns("success")
+      task.expects(:wait_for_completion)
+      task.expects(:info).returns(info)
+      vm.expects(:ReconfigVM_Task).returns(task)
+      provider.stubs(:vm).returns(vm)
+      provider.assign_networks
+    end
+
+    it "should raise error if portgroup not found for one of the networks" do
+      vm = mock("vm")
+      hardware = mock("hardware")
+      config = mock("config")
+      cluster = mock("cluster")
+      cluster.expects(:network).returns([])
+      vm.stubs(:config).returns(config)
+      config.stubs(:hardware).returns(hardware)
+      hardware.stubs(:device).returns([])
+      provider.stubs(:resource).returns(:network_interfaces => ["network"])
+      provider.expects(:network_names).returns("pg_name" => "mgmt")
+      provider.expects(:power_state).at_least_once.returns("PoweredOff")
+      provider.stubs(:cluster).returns(cluster)
+      vm.expects(:ReconfigVM_Task).never
+      provider.stubs(:vm).returns(vm)
+      expect { provider.assign_networks }.to raise_error("Could not find portgroup on VDS for pg mgmt")
+    end
+
+    it "should raise error if reconfigure vm task fails" do
+      vm = mock("vm")
+      hardware = mock("hardware")
+      config = mock("config")
+      net_config = mock("net_config")
+      cluster = mock("cluster")
+      portgroup = mock("portgroup")
+      portgroup.stubs(:name).returns("mgmt")
+      net_config.expects(:key).returns(456)
+      vds = mock("vds")
+      vds.expects(:uuid).at_least_once.returns("50 36 1b 02 5b 5b 0a 01-ee cc 98 61 79 58 8f 63")
+      net_config.expects(:distributedVirtualSwitch).at_least_once.returns(vds)
+      portgroup.stubs(:config).returns(net_config)
+      cluster.expects(:network).returns([portgroup])
+      vm.stubs(:config).returns(config)
+      config.stubs(:hardware).returns(hardware)
+      hardware.stubs(:device).returns([])
+      provider.stubs(:resource).returns(:network_interfaces => ["network"])
+      provider.expects(:network_names).returns("pg_name" => "mgmt")
+      provider.expects(:power_state).at_least_once.returns("PoweredOff")
+      provider.stubs(:cluster).returns(cluster)
+      task = mock("task")
+      info = mock("info")
+      info.expects(:state).returns("error")
+      info.expects(:error).returns("Could not complete the operation.")
+      task.expects(:wait_for_completion)
+      task.expects(:info).at_least_once.returns(info)
+      vm.expects(:ReconfigVM_Task).returns(task)
+      provider.stubs(:vm).returns(vm)
+      expect {provider.assign_networks }.to raise_error("Failed to create virtual machine networks: Could not complete the operation.")
     end
   end
 
