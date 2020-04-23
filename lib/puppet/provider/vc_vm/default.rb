@@ -12,6 +12,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
   HOST_LOCAL_PMEM_STORAGE_PROFILE_ID = "c268da1b-b343-49f7-a468-b1deeb7078e0".freeze
   TEMP_NVDIMM_KEY = -103
   DATASTORE_USAGE_ALARM_NAME = "Datastore usage on disk"
+  VM_PCI_SLOT_ORDER = [160, 1184, 2208, 192, 1216, 2240, 224, 1248, 2272, 256, 1280, 2304].freeze
 
   def exists?
     initialize_property_flush
@@ -1189,71 +1190,6 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     net["portgroup"]
   end
 
-  # Returns a hash of the network mappings from VM Networks in the
-  # provided OVF file to the networks that exist on a host.  It takes
-  # the desired network names as input, and finds the associated network
-  # object on the host to include in the mapping.
-  def network_mappings(ovf_url, cluster)
-    network_mappings = {}
-    # Query OVF to find any networks which need to be mapped
-    begin
-      ovf = open(ovf_url, 'r'){|io| Nokogiri::XML(io.read)}
-    rescue
-      Puppet.debug("Failed to open ovf: %s for reason: %s" % [ovf_url.to_s, $!.to_s])
-      raise
-    end
-
-    raise("Unable to obtain ovf from: %s" % ovf_url) unless ovf
-
-    ovf.remove_namespaces!
-    network_objs = ovf.xpath('//NetworkSection/Network')
-    networks = network_objs.map{|x| x['name']}
-    return network_mappings unless networks
-
-    # If list of networks were passed as input then map them to the VM Networks in the
-    # OVF.  If fewer networks are passed in that what are available on the OVF the last
-    # input network will be repeated on all available VMNetworks
-    if resource[:network_interfaces]
-      this_net = nil
-      resource[:network_interfaces].each_with_index do |net,index|
-        portgroup_name = network_names(net)["pg_name"]
-        this_net = cluster.network.find{|x| x.name == portgroup_name}
-        raise("Input network name: %s is not found in cluster" % portgroup_name) unless this_net
-        Puppet.debug("Mapping network %s to %s" % [networks[index], this_net.name])
-        network_mappings[networks[index]] = this_net
-      end
-
-      # If input network list was smaller than number of VM Networks in the OVF
-      # Fill in remaining OVF networks with last available input network
-      if resource[:network_interfaces].size < networks.size
-        vm_net = cluster.network.find{|x| x.name == "VM Network"}
-        spare_network = vm_net.nil? ? this_net : vm_net
-        networks[resource[:network_interfaces].size..-1].each do |net|
-          Puppet.debug("Mapping network %s to %s" % [net, spare_network.name])
-          network_mappings[net] = spare_network
-        end
-      end
-    else
-      network = cluster.network[0]
-      network_mappings = Hash[networks.map{|x| [x, network]}]
-    end
-    
-    network_mappings = adjust_networks_flex_svm(network_mappings, networks) if resource[:network_interfaces]
-    network_mappings
-  end
-
-  # Fixes issue with VMware Network mapping not being applied in logical order
-  def adjust_networks_flex_svm(network_mappings, networks)
-    return network_mappings if networks.size == 1
-    mgmt = network_mappings[networks[0]]
-    d1 = network_mappings[networks[1]]
-    d2 = network_mappings[networks[2]]
-    network_mappings[networks[0]] = d1
-    network_mappings[networks[1]] = d2
-    network_mappings[networks[2]] = mgmt
-    network_mappings
-  end
-
   # Use reconfigure VM task to set memory and CPU on VM
   # This will return error if VM is not in the powered off state
   # Input memory is in MB
@@ -1320,6 +1256,113 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     raise("Failed vm configuration task for %s with error %s" % [vm.name, task.info[:error][:localizedMessage]]) if task.info[:state] == "error"
   end
 
+  # This method assigns network portgroups to the NICs in the vm
+  # If the base vm does not have the correct number of nics for the networks
+  # requested, then we will adjust the number of NICs on the VM
+  # to match the requested networks
+  def assign_networks
+    raise("Virtual machine required to assign networks") unless vm
+
+    if power_state == 'poweredOn'
+      Puppet.notice "Powering off VM #{resource[:name]} prior to creating ans assigning networks."
+      vm.PowerOffVM_Task.wait_for_completion
+    else
+      Puppet.debug "Virtual machine state: #{power_state}"
+    end
+
+    nics = vm.config
+             .hardware
+             .device
+             .find_all{ |dev| dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000)}
+    pciSlots = vm.config
+                 .hardware
+                 .device
+                 .select{ |dev| !dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000)}
+                 .map { |dev| dev&.slotInfo&.pciSlotNumber}.reject{|slotnum| slotnum.nil?}
+    slotorder = VM_PCI_SLOT_ORDER.dup
+    slotorder = slotorder.reject{ |slot| pciSlots.include?(slot)}
+
+    spec = RbVmomi::VIM::VirtualMachineConfigSpec.new
+    nic_changes = []
+    nics.each_with_index do |nic, index|
+      nic_spec = RbVmomi::VIM::VirtualDeviceConfigSpec.new
+      net = resource[:network_interfaces][index]
+      if net
+        portgroup_name = network_names(net)["pg_name"]
+        this_net = cluster.network.find{|x| x.name == portgroup_name}
+        raise("Could not find portgroup on VDS for pg %s" % portgroup_name) unless this_net
+
+        Puppet.debug("Updating network: %s on virtual machine" % portgroup_name)
+        nic.backing = RbVmomi::VIM::VirtualEthernetCardDistributedVirtualPortBackingInfo.new(
+          :port => RbVmomi::VIM::DistributedVirtualSwitchPortConnection.new(
+            :portKey => nil,
+            :portgroupKey => this_net.config.key,
+            :switchUuid => this_net.config.distributedVirtualSwitch.uuid
+          )
+        )
+        nic.slotInfo = RbVmomi::VIM::VirtualDevicePciBusSlotInfo.new(
+          :pciSlotNumber => slotorder.delete_at(0)
+        )
+        nic_spec.device = nic
+        nic_spec.operation = "edit"
+      else
+        Puppet.debug("Removing unused NIC from virtual machine" % portgroup_name)
+        nic_spec.device = nic
+        nic_spec.operation = "remove"
+      end
+      nic_changes << nic_spec
+    end
+
+    net_size = resource[:network_interfaces].size
+    # Check to see if we need to add extra nics to VM to fulfill all network requirements
+    if nics.size < net_size
+      remaining_nets = resource[:network_interfaces].slice(nics.size, net_size)
+
+      adapter_num = nics.size.zero? ? 1 : nics.size
+      remaining_nets.each do |net|
+        nic_spec = RbVmomi::VIM::VirtualDeviceConfigSpec.new
+        portgroup_name = network_names(net)["pg_name"]
+        Puppet.debug("Adding network: %s to virtual machine" % portgroup_name)
+        this_net = cluster.network.find{|x| x.name == portgroup_name}
+        raise("Could not find portgroup on VDS for pg %s" % portgroup_name) unless this_net
+
+        label = "Network Adapter %s" % adapter_num.to_s
+        summary = "DVSwitch: %s" % this_net.config.distributedVirtualSwitch.uuid
+        nic_spec.operation = "add"
+        nic_spec.device = RbVmomi::VIM::VirtualVmxnet3.new(
+          :backing => RbVmomi::VIM::VirtualEthernetCardDistributedVirtualPortBackingInfo.new(
+            :port => RbVmomi::VIM::DistributedVirtualSwitchPortConnection.new(
+              :portgroupKey => this_net.config.key,
+              :switchUuid => this_net.config.distributedVirtualSwitch.uuid
+            )
+          ),
+          :connectable => RbVmomi::VIM::VirtualDeviceConnectInfo.new(
+            :allowGuestControl => true,
+            :connected => false,
+            :startConnected => true,
+            :status => "untried"
+          ),
+          :deviceInfo => RbVmomi::VIM::Description.new(
+            :label => label,
+            :summary => summary
+          ),
+          :key => -1,
+          :slotInfo => RbVmomi::VIM::VirtualDevicePciBusSlotInfo.new(
+            :pciSlotNumber => slotorder.delete_at(0)
+          ),
+          :wakeOnLanEnabled => true
+        )
+        nic_changes << nic_spec
+      end
+    end
+    spec.deviceChange = nic_changes
+    task = vm.ReconfigVM_Task(:spec => spec)
+    task.wait_for_completion
+    raise("Failed to create virtual machine networks: %s" % task.info.error.to_s) unless task.info.state == "success"
+
+    nil
+  end
+
   # This method create a VMware Virtual Machine instance based on an OVF provided
   # via a URL location.
   def deploy_ovf
@@ -1359,12 +1402,14 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
           host: host,
           resourcePool: cluster.resourcePool,
           datastore: datastore,
-          networkMappings: network_mappings(ovf_url, cluster),
+          networkMappings: {},
           propertyMappings: ovf_property_map)
     rescue RbVmomi::Fault => fault
       Puppet.debug("Failure during OVF deployment for vm: %s with error %s: %s" % [vm_name.to_s, $!.to_s, $!.class])
       raise
     end
+
+    assign_networks if resource[:network_interfaces] && !resource[:network_interfaces].empty?
 
     if resource[:memory_mb] || resource[:num_cpus]
       vm_memory_cpu_scsi_for_svm(vm, resource[:memory_mb], resource[:num_cpus]) if vm
@@ -1372,7 +1417,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     end
 
     # We only reconfigure the the guestid in nvdimm case. In other scenarios we should just use the existing guestid
-    # which is set in the OVF. 
+    # which is set in the OVF.
     if resource[:guest_type] && resource[:guestid] && resource[:enable_nvdimm]
       vm_guest_os(vm, resource[:guest_type], resource[:guestid])
     end
