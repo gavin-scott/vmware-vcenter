@@ -32,8 +32,8 @@ def collect_vcenter_facts(vim)
   build = vim.serviceContent.about.build
   {
       :vcenter_name => name,
-      :service_tag => name,
-      :puppet_certname => "vcenter-%s" % [name],
+      :service_tag => name.downcase,
+      :puppet_certname => "vcenter-%s" % [name.downcase],
       :vcenter_version => version,
       :vcenter_build => build,
       :datacenter_count => @datacenter_count.to_s,
