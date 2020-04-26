@@ -80,7 +80,8 @@ def collect_inventory(obj, parent=nil)
     when RbVmomi::VIM::Datacenter
       @datacenter_count += 1
       vds_children = obj.networkFolder.children.find_all{|x| x.is_a?(RbVmomi::VIM::VmwareDistributedVirtualSwitch)}
-      (obj.hostFolder.children + vds_children).each { |resource| hash[:children] << collect_inventory(resource) }
+      vds_folders = obj.networkFolder.children.find_all{|x| x.is_a?(RbVmomi::VIM::Folder)}
+      (obj.hostFolder.children + vds_children + vds_folders).each { |resource| hash[:children] << collect_inventory(resource) }
     when RbVmomi::VIM::ClusterComputeResource
       @cluster_count += 1
       obj.host.each { |host| hash[:children] << collect_inventory(host) }
@@ -113,8 +114,22 @@ def collect_inventory(obj, parent=nil)
   hash
 end
 
+def object_path(obj)
+  path = ""
+  case obj
+  when RbVmomi::VIM::Datacenter
+    obj.path[1..-1].map {|p| path.concat("/%s" % p[1])}.first
+  when RbVmomi::VIM::ComputeResource
+    obj_path = obj.path
+    start_index = obj_path.index {|p| p[1] == "host" }
+    obj_path[start_index+1..-1].map {|p| path.concat("/%s" % p[1])}.first
+  else
+    ""
+  end 
+end
+
 def collect_simple_inventory(obj, parent=nil)
- {:name => obj.name, :id => obj._ref, :type => obj.class, :attributes => {}, :children => []}
+ {:name => obj.name, :id => obj._ref, :type => obj.class, :attributes => {}, :children => [], :path => object_path(obj)}
 end
 
 def collect_cluster_attributes(obj)
@@ -393,9 +408,10 @@ def create_datastore_metadata(obj)
   @datacenter_storage_info = datacenter_storage_info
 end
 
-
 def create_port_group_metadata(obj)
   obj.children.each do |dc|
+    create_port_group_metadata(dc) if dc.is_a?(RbVmomi::VIM::Folder)
+
     next unless dc.respond_to?(:networkFolder)
 
     dc.networkFolder.children.each do |network_obj|
