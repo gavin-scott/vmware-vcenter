@@ -109,9 +109,10 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
 
 
  def get_host_management_ip
-   nic = find_vm_host.config.network.vnic.find { |nic| nic.device == "vmk0"}
-
-   ASM::Util.get_preferred_ip(nic.spec.ip.ipAddress)
+   # Selecting host ip on the basis of kernel device type fails when the management is not on vmk0
+   # Hence changing the logic to pick the actual management ip based on ping check
+   ip = ASM::Util.get_host_vnic_ip_address(find_vm_host)
+   ASM::Util.get_preferred_ip(ip)
   end
 
   # Adds nfs_datastore on the host of the vm
