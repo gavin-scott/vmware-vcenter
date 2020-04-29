@@ -1286,13 +1286,13 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
              .hardware
              .device
              .find_all{ |dev| dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000)}
-    pciSlots = vm.config
+    pci_slots = vm.config
                  .hardware
                  .device
                  .select{ |dev| !dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000)}
                  .map { |dev| dev&.slotInfo&.pciSlotNumber}.reject{|slotnum| slotnum.nil?}
     slotorder = VM_PCI_SLOT_ORDER.dup
-    slotorder = slotorder.reject{ |slot| pciSlots.include?(slot)}
+    slotorder = slotorder.reject{ |slot| pci_slots.include?(slot)}
 
     spec = RbVmomi::VIM::VirtualMachineConfigSpec.new
     nic_changes = []
@@ -1375,6 +1375,36 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     nil
   end
 
+   # The method ensures any VM Network on the OVF gets a preliminary mapping at
+   # deployment or the ovf deployment will fail
+  def map_ovf_nets(ovf_url, cluster)
+    network_mappings = {}
+    # Query OVF to find any networks which need to be mapped
+    begin
+      ovf = open(ovf_url, 'r'){|io| Nokogiri::XML(io.read)}
+    rescue
+      Puppet.debug("Failed to open ovf: %s for reason: %s" % [ovf_url.to_s, $!.to_s])
+      raise
+    end
+
+    ovf.remove_namespaces!
+    network_objs = ovf.xpath('//NetworkSection/Network')
+    networks = network_objs.map{|x| x['name']}
+    return network_mappings unless networks
+
+    # Grab the first portgroup to map to all ovf networks
+    # These will get assigned correct networks in assing_networks
+    net = resource[:network_interfaces].first
+    portgroup_name = network_names(net)["pg_name"]
+    pg_net = cluster.network.find{|x| x.name == portgroup_name}
+
+    networks.each_with_index do |ovf_net, index|
+      network_mappings[ovf_net] = pg_net
+    end
+
+    network_mappings
+  end
+
   # This method create a VMware Virtual Machine instance based on an OVF provided
   # via a URL location.
   def deploy_ovf
@@ -1414,7 +1444,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
           host: host,
           resourcePool: cluster.resourcePool,
           datastore: datastore,
-          networkMappings: {},
+          networkMappings:  map_ovf_nets(ovf_url, cluster),
           propertyMappings: ovf_property_map)
     rescue RbVmomi::Fault => fault
       Puppet.debug("Failure during OVF deployment for vm: %s with error %s: %s" % [vm_name.to_s, $!.to_s, $!.class])
