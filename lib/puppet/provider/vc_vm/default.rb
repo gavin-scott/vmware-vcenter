@@ -188,23 +188,24 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
   def network_adapter_spec
     network_spec = []
     new_networks = resource[:network_interfaces]
-    new_network_names = new_networks.collect { |n| n["portgroup"] }
     adapters = vm.config.hardware.device.find_all do |x|
       x if x.class < RbVmomi::VIM::VirtualEthernetCard
     end
-    index = 0
     adapters_to_remove = []
 
     # We loop through and make a list of network adapters to be removed by
     # comparing the requested networks to the networks on the existing adapters
     adapters.each do |adapter|
+      network_label = nil
       if adapter.backing.is_a?(RbVmomi::VIM::VirtualEthernetCardDistributedVirtualPortBackingInfo)
         network_label = portgroup_name(adapter)
       else
         network_label = adapter.backing.deviceName
       end
-      if new_network_names[index] == network_label
-        index += 1
+      new_net_found = new_networks.find { |new_net| new_net["portgroup"] && network_label.include?(new_net["portgroup"]["pg_name"])}
+      if new_net_found
+        new_networks.delete(new_net_found)
+        Puppet.debug("New network already present on adapter" % new_net_found)
       else
         adapters_to_remove << adapter
       end
@@ -219,7 +220,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     end
 
     # Add specs to add network adapters
-    networks_to_add = new_networks[index..-1]
+    networks_to_add = new_networks
     network_spec.concat(network_specs(networks_to_add)) if networks_to_add
     network_spec
   end
@@ -1144,8 +1145,19 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
     RbVmomi::VIM.VirtualDeviceConfigSpec(config)
   end
 
+   # Queries VM for pci slots used by non-network adapter devices
+  def used_device_pci_slots
+    pci_slots = vm.config
+                    .hardware
+                    .device
+                    .select { |dev| !dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000) }
+                    .map { |dev| dev&.slotInfo&.pciSlotNumber }.reject { |slotnum| slotnum.nil? }
+    VM_PCI_SLOT_ORDER.reject { |slot| pci_slots.include?(slot) }
+  end
+
   # get network configuration
   def network_specs(interfaces=resource[:network_interfaces], action='add')
+    slot_order = used_device_pci_slots
     interfaces.each_with_index.collect do |nic, index|
       portgroup = nic['portgroup']
       if portgroup["vds_name"]
@@ -1166,7 +1178,10 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
           :deviceInfo => {
             :label => "Network Adapter",
             :summary => portgroup
-          }
+          },
+          :slotInfo => RbVmomi::VIM::VirtualDevicePciBusSlotInfo.new(
+            :pciSlotNumber => slot_order.delete_at(0)
+          )
         }
       )
       RbVmomi::VIM.VirtualDeviceConfigSpec(
@@ -1287,13 +1302,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
              .hardware
              .device
              .find_all{ |dev| dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000)}
-    pci_slots = vm.config
-                 .hardware
-                 .device
-                 .select{ |dev| !dev.is_a?(RbVmomi::VIM::VirtualVmxnet3) || dev.is_a?(RbVmomi::VIM::VirtualE1000)}
-                 .map { |dev| dev&.slotInfo&.pciSlotNumber}.reject{|slotnum| slotnum.nil?}
-    slotorder = VM_PCI_SLOT_ORDER.dup
-    slotorder = slotorder.reject{ |slot| pci_slots.include?(slot)}
+    slot_order = used_device_pci_slots
 
     spec = RbVmomi::VIM::VirtualMachineConfigSpec.new
     nic_changes = []
@@ -1314,7 +1323,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
           )
         )
         nic.slotInfo = RbVmomi::VIM::VirtualDevicePciBusSlotInfo.new(
-          :pciSlotNumber => slotorder.delete_at(0)
+          :pciSlotNumber => slot_order.delete_at(0)
         )
         nic_spec.device = nic
         nic_spec.operation = "edit"
@@ -1361,7 +1370,7 @@ Puppet::Type.type(:vc_vm).provide(:vc_vm, :parent => Puppet::Provider::Vcenter) 
           ),
           :key => -1,
           :slotInfo => RbVmomi::VIM::VirtualDevicePciBusSlotInfo.new(
-            :pciSlotNumber => slotorder.delete_at(0)
+            :pciSlotNumber => slot_order.delete_at(0)
           ),
           :wakeOnLanEnabled => true
         )
